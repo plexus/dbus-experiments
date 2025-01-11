@@ -1,0 +1,1 @@
+➜ jextract -I /usr/lib/x86_64-linux-gnu/dbus-1.0/include -I /usr/include/dbus-1.0/ /usr/include/dbus-1.0/dbus/dbus.h --target-package net.arnebrasseur.ffi --header-class-name DBus --library dbus --output src-java
