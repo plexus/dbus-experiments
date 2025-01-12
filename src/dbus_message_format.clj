@@ -8,12 +8,32 @@
 
 (set! *warn-on-reflection* true)
 
+(declare get-byte get-signature get-string get-string get-uint32
+         put-byte put-signature put-string put-string put-uint32)
+
+(def types
+  [{:id :bool :sig \b}
+   {:id :byte :sig \y :read get-byte :write put-byte}
+   {:id :double :sig \d}
+   {:id :int16 :sig \n}
+   {:id :int32 :sig \i}
+   {:id :int64 :sig \x}
+   {:id :object-path :sig \o :read get-string :write put-string}
+   {:id :signature :sig \g :read get-signature :write put-signature}
+   {:id :string :sig \s :read get-string :write put-string}
+   {:id :uint16 :sig \q}
+   {:id :uint32 :sig \u :read get-uint32 :write put-uint32}
+   {:id :uint64 :sig \t}
+   {:id :array :sig \a :read get-array :write put-array}
+   {:id :variant :sig \v}
+   {:id :struct :sig \( :sig-end\)}])
+
 (def message-types
   [:invalid :method-call :method-return :error :signal])
 
 (def headers
   [[:invalid nil]
-   [:path :string]
+   [:path :object-path]
    [:interface :string]
    [:member :string]
    [:error-name :string]
@@ -22,6 +42,11 @@
    [:sender :string]
    [:signature :signature]
    [:unix-fds :uint32]])
+
+(def sig->type* (into {} (map (juxt :sig :id)) types))
+(def type->sig* (into {} (map (juxt :id :sig)) types))
+(def type->write-fn* (into {} (map (juxt :id :write)) types))
+(def type->read-fn* (into {} (map (juxt :id :read)) types))
 
 (def offset 0)
 
@@ -60,63 +85,57 @@
     res))
 
 (defn get-signature [^ByteBuffer buf]
-  (prn "SIG" (.position buf))
   (let [len (get-byte buf)
-        _ (prn "SIG" (.position buf) len (.get buf (.position buf)))
         res (String. ^bytes (let [ba (byte-array len)]
                               (.get buf ba 0 len)
                               ba))]
     (.get buf) ;; NULL
     res))
 
-(defn read-type [buf t]
-  ((case t
-     :byte get-byte
-     :uint32 get-uint32
-     :string get-string
-     :signature (fn [buf]
-                  (get-signature buf)
-                  (get-signature buf))
-     (cond
-       (vector? t)
-       (case (first t)
-         :tuple
-         (if (= 1 (count t))
-           (constantly nil)
-           (apply juxt
-                  (map (fn [t] #(read-type % t)) (rest t)))))
 
-       :else
-       (throw (ex-info  "unimplemented type" {:t t}) )
-       ))
+(defn read-type [buf t]
+  ((or (type->read-fn* t)
+       (cond
+         (vector? t)
+         (case (first t)
+           :tuple
+           (if (= 1 (count t))
+             (constantly nil)
+             (apply juxt
+                    (map (fn [t] #(read-type % t)) (rest t)))))
+
+         :else
+         (throw (ex-info  "unimplemented type" {:t t}))))
    buf))
 
 (defn read-header [^ByteBuffer buf]
   (align buf 8)
   (let [code (get-byte buf)
-        _ (prn "<H" (.position buf) code)
+        ;; _ (prn "<H" (.position buf) code)
         _ (assert (< 0 code 10) code)
         [h t] (nth headers code)
-        v (read-type buf t)]
-    (prn [(.position buf) h t v])
+        sig (get-signature buf)
+        v (read-type buf (sig->type sig))]
+    ;; (prn [(.position buf) h t v])
     [h v]))
+
+
+(defn type->sig [t]
+  (if (vector? t)
+    (case (first t)
+      :tuple
+      (apply str (map type->sig (rest t)))
+      :array
+      (str "a" (type->sig (second t)))
+      :struct
+      (str "(" (apply str (map type->sig (rest t))) ")")
+      :variant
+      "v")
+    (str (type->sig* t))))
 
 (defn sig->type [sig]
   (if (char? sig)
-    (case sig
-      \y :byte
-      \b :bool
-      \n :int16
-      \q :uint16
-      \i :int32
-      \u :uint32
-      \x :int64
-      \t :uint64
-      \d :double
-      \s :string
-      \o :object-path
-      \g :signature
-      )
+    (sig->type* sig)
     (loop [t [:tuple]
            [c & cs] sig]
       (if (not c)
@@ -128,6 +147,16 @@
                  (into [:struct] (next (sig->type
                                         (take-while (complement #{\)}) cs)))))
            (next (drop-while (complement #{\)}) cs)))
+          \a
+          (recur
+           (conj t [:array (sig->type (first cs))])
+           (next cs))
+
+          \v
+          (let [[_tuple & ts] (sig->type cs)]
+            (into (conj t [:variant (first ts)]) (next ts)))
+
+          #_else
           (recur (conj t (sig->type c))
                  cs))))))
 
@@ -192,7 +221,6 @@
 
 (defn write-array [^ByteBuffer buf write-elements-fn]
   (align buf 4)
-  (prn "ARRAY"  (.position buf))
   (let [size-pos (.position buf)]
     (.putInt buf 0)
     (write-elements-fn buf)
@@ -212,26 +240,26 @@
     (.position b 0)
     (repeatedly p #(.get b))))
 
-(defn write-type [buf t v]
-  ((case t
-     :byte put-byte
-     :uint32 put-uint32
-     :string put-string
-     :signature put-signature
-     (cond
-       (vector? t)
-       (case (first t)
-         :tuple
-         (if (= 1 (count t))
-           (constantly nil)
-           (apply juxt
-                  (map (fn [t] #(write-type % t)) (rest t)))))
 
-       :else
-       (throw (ex-info  "unimplemented type" {:t t}) )
-       ))
-   buf
-   v))
+(defn write-type [buf t v]
+  ((or
+    (type->write-fn* t)
+    (cond
+      (vector? t)
+      (case (first t)
+        :tuple
+        (if (= 1 (count t))
+          (constantly nil)
+          (apply juxt
+                 (map (fn [t] #(write-type % t)) (rest t))))
+        :variant
+        (fn [buf v]
+          (put-signature buf (type->sig (second t)))
+          (write-type buf (second t) v)))
+
+      :else
+      (throw (ex-info  "unimplemented type" {:t t}) )))
+   buf v))
 
 (defn write-headers [^ByteBuffer buf header-map]
   (let [hidx (into {} (map-indexed (fn [idx [k v]] [k idx]) headers))
@@ -240,9 +268,10 @@
       (align buf 8)
       (let [t (get headers k)
             code (get hidx k)]
-        (println ["H" k code t v (.position buf)])
+        ;; (println ["H" k code t v (.position buf)])
         (put-byte buf code)
-        (write-type buf t v)))))
+        (write-type buf [:variant t] v)))
+    buf))
 
 (defn write-message [^ByteBuffer buf {:keys [type flags headers version serial]
                                       :or {version 1}}]
@@ -264,149 +293,164 @@
     (put-uint32 buf serial)
 
     (write-array buf #(write-headers % headers))
-    buf
-    ))
-
-(defn send-mes)
-
-(.indexOf ^java.util.List message-types type)
+    (align buf 4)
+    buf))
 
 (defn dbus-session-sock []
   (let [[_ path] (re-find #"unix:path=(.*)" (System/getenv "DBUS_SESSION_BUS_ADDRESS"))]
     (SocketChannel/open (UnixDomainSocketAddress/of ^String path))))
 
-(let [buf (ByteBuffer/allocate 1024)]
-  (.order buf ByteOrder/LITTLE_ENDIAN)
-  (.mark buf)
-  #_#_(put-byte buf 0)
-  (.put buf (.getBytes (str "AUTH EXTERNAL 31303030"
-                            #_                            (apply str (map (partial format "%02x")
-                                                                          (map long (str (.pid
-                                                                                          (ProcessHandle/current))))))
-                            "\r\n"
-                            )))
-  (write-message buf
-                 {:type :method-call,
-                  :flags {},
-                  :version 1,
-                  :serial 1,
-                  :headers
-                  {:path "/org/freedesktop/DBus"
-                   :member "Hello"
-                   :interface "org.freedesktop.DBus"
-                   :destination "org.freedesktop.DBus"}})
-  (.flip buf)
-  (.write chan buf)#_#_
-  (def buf buf)
-  (read-message buf)
-  )
-offset
-(.limit buf)
-(let [bs (drop 12 (show-buffer-lim buf))]
-  (map  vector
-        (take 16 bs)
-        (take 16 (map char bs))))
+(comment
+  (let [buf (ByteBuffer/allocate 1024)]
+    (.order buf ByteOrder/LITTLE_ENDIAN)
+    (.mark buf)
+    #_#_(put-byte buf 0)
+    (.put buf (.getBytes (str "AUTH EXTERNAL 31303030"
+                              #_                            (apply str (map (partial format "%02x")
+                                                                            (map long (str (.pid
+                                                                                            (ProcessHandle/current))))))
+                              "\r\n"
+                              )))
+    (write-message buf
+                   {:type :method-call,
+                    :flags {},
+                    :version 1,
+                    :serial 1,
+                    :headers
+                    {:path "/org/freedesktop/DBus"
+                     :member "Hello"
+                     :interface "org.freedesktop.DBus"
+                     :destination "org.freedesktop.DBus"}})
+    (.flip buf)
+    (.write chan buf)#_#_
+    (def buf buf)
+    (read-message buf)
+    )
+
+  offset
+  (.limit buf)
+  (let [bs (drop 12 (show-buffer-lim buf))]
+    (map  vector
+          (take 16 bs)
+          (take 16 (map char bs)))))
 
 
 (defn sock-read ^bytes [^SocketChannel chan]
   (let [buf (ByteBuffer/allocate 1024)]
     (.mark buf)
-    (let [len (.read chan buf)
-          arr (byte-array len)]
-      (.flip buf)
-      (.get buf arr 0 len)
-      arr)))
+    (let [len (.read chan buf)]
+      (if (< 0 len)
+        (let [arr (byte-array len)]
+          (.flip buf)
+          (.get buf arr 0 len)
+          arr)
+        (do
+          (println "WARN: read from closed channel")
+          (byte-array 0))))))
 
-(defn sock-write [^SocketChannel chan s]
+(defn sock-write [^SocketChannel chan ^String s]
+  (prn s)
   (let [buf (ByteBuffer/allocate 1024)]
     (.mark buf)
     (.put buf (.getBytes s))
     (.flip buf)
     (.write chan buf)))
 
-(def server-sock
-  (doto (ServerSocketChannel/open StandardProtocolFamily/UNIX)
-    (.bind (UnixDomainSocketAddress/of "/home/arne/tmp/dbus-socket"))))
-
-(def sock
-  (.accept server-sock))
-
-
-(def arr
-  (sock-read sock))
-
-(sock-write sock "REJECTED EXTERNAL\r\n")
-(sock-write sock "DATA\r\n")
-(sock-write sock "OK 18f436e3312715725ef4204b67810658\r\n")
-(sock-write sock "AGREE_UNIX_FD\r\n")
-(String. (sock-read sock))
-(subs (String. arr) (+ 12))
-(map-indexed vector (map (juxt long char) (drop 7 arr)))
-
-
-(long \m)
-
-;;
-(let [s (dbus-session-sock)]
-  (sock-write s (str "\0" "AUTH\r\n"))
-  (println (String. (sock-read s))) ;; "REJECTED EXTERNAL\r\n"
-  (sock-write s "AUTH EXTERNAL\r\n")
-  (println (String. (sock-read s))) ;; "DATA\r\n"
-  (sock-write s "DATA\r\n")
-  (println (String. (sock-read s))) ;; "OK 18f436e3312715725ef4204b67810658\r\n"
-  (sock-write s "NEGOTIATE_UNIX_FD\r\n")
-  (println (String. (sock-read s)))
-  (sock-write s "BEGIN\r\n")
-  (let [b (ByteBuffer/allocate 1024)]
-    (.order b ByteOrder/LITTLE_ENDIAN)
-    (write-message b {:type :method-call,
-                      :flags {},
-                      :version 1,
-                      :serial 1,
-                      :headers
-                      {:path "/org/freedesktop/DBus"
-                       :member "Hello"
-                       :interface "org.freedesktop.DBus"
-                       }})
-    (.flip b)
-    (.write s b))
-  (println (String. (sock-read s)))
-  )
-;; => Reflection warning, /home/arne/dbus-test/src/dbus_message_format.clj:343:3 - call to java.lang.String ctor can't be resolved.
-;;    Reflection warning, /home/arne/dbus-test/src/dbus_message_format.clj:345:3 - call to java.lang.String ctor can't be resolved.
-;;    Reflection warning, /home/arne/dbus-test/src/dbus_message_format.clj:347:3 - call to java.lang.String ctor can't be resolved.
-;;    "OK 18f436e3312715725ef4204b67810658\r\n"
-(char 108)
-(read-message
- (ByteBuffer/wrap arr 7 (- (count arr) 7)))
-
 (defn write-to-str [f & args]
-  (let [b (ByteBuffer/allocate 1024)]
+  (let [^ByteBuffer b (ByteBuffer/allocate 1024)]
     (.mark b)
     (apply f b args)
     (let [len (.position b)
           arr (byte-array len)]
-      (.flip buf)
-      (.get buf arr 0 len)
+      (.flip b)
+      (.get b arr 0 len)
       (String. arr))))
-[(write-to-str
-  write-message
-  {:type :method-call,
-   :flags {},
-   :version 1,
-   :serial 1,
-   :headers
-   {:path "/org/freedesktop/DBus"
-    :member "Hello"
-    :interface "org.freedesktop.DBus"
-    }})]
-(subs (String. arr) (+ 7 ;; BEGIN
-                       ;; 12 ;; HEADER
-                       ;; 4 ;; arr-len
-                       ;; 1 ;; 3 MEMBER
 
-                       ;; 2
-                       ))
+(comment
+  (def server-sock
+    (doto (ServerSocketChannel/open StandardProtocolFamily/UNIX)
+      (.bind (UnixDomainSocketAddress/of "/home/arne/tmp/dbus-socket"))))
+
+  (def sock
+    (.accept server-sock))
+
+
+  (def arr
+    (sock-read sock))
+
+  (sock-write sock "REJECTED EXTERNAL\r\n")
+  (sock-write sock "DATA\r\n")
+  (sock-write sock "OK 18f436e3312715725ef4204b67810658\r\n")
+  (sock-write sock "AGREE_UNIX_FD\r\n")
+  (String. (sock-read sock))
+  (subs (String. arr) (+ 12))
+  (map-indexed vector (map (juxt long char) (drop 7 arr)))
+
+
+  (long \m)
+
+  (let [s (dbus-session-sock)]
+    (sock-write s (str "\0" "AUTH\r\n"))
+    (prn (String. (sock-read s))) ;; "REJECTED EXTERNAL\r\n"
+    (sock-write s "AUTH EXTERNAL\r\n")
+    (prn (String. (sock-read s))) ;; "DATA\r\n"
+    (sock-write s "DATA\r\n")
+    (prn (String. (sock-read s))) ;; "OK 18f436e3312715725ef4204b67810658\r\n"
+    (sock-write s "NEGOTIATE_UNIX_FD\r\n")
+    (prn (String. (sock-read s)))
+    (sock-write s "BEGIN\r\n")
+
+    (let [bs (byte-array 1024)
+          b (ByteBuffer/wrap bs)]
+      (.mark b)
+      (.order b ByteOrder/LITTLE_ENDIAN)
+      (def offset 0)
+      (write-message b {:type :method-call,
+                        :flags {},
+                        :version 1,
+                        :serial 1,
+                        :headers
+                        {:path "/org/freedesktop/DBus"
+                         :member "Hello"
+                         :interface "org.freedesktop.DBus"
+                         :destination "org.freedesktop.DBus"
+                         }})
+      ;; (put-byte b 0)
+      ;; (put-byte b 0)
+      ;; (put-byte b 0)
+      (.flip b)
+      (prn (String. (into-array Byte/TYPE
+                                (subvec (vec bs)
+                                        (.position b)
+                                        (.limit b)))))
+      (.write s b))
+    (prn (read-message (ByteBuffer/wrap (sock-read s)))))
+
+  (char 108)
+  (read-message
+   (ByteBuffer/wrap arr 7 (- (count arr) 7)))
+
+
+  (write-to-str
+   write-message
+   {:type :method-call,
+    :flags {},
+    :version 1,
+    :serial 1,
+    :headers
+    {:path "/org/freedesktop/DBus"
+     :member "Hello"
+     :interface "org.freedesktop.DBus"
+     :destination "org.freedesktop.DBus",
+     }})
+
+  (subs (String. arr) (+ 7 ;; BEGIN
+                         ;; 12 ;; HEADER
+                         ;; 4 ;; arr-len
+                         ;; 1 ;; 3 MEMBER
+
+                         ;; 2
+                         )))
 
 "l " ;;h1
 "    " ;;h2
@@ -420,59 +464,107 @@ offset
 "   org.freedesktop.DBus "
 "   "
 ""
-(char 6)
 
-(let [^SocketChannel in (.accept ^ServerSocketChannel server-sock)
-      ^SocketChannel out (dbus-session-sock)]
-  (let [bs (byte-array 1024)
-        ^ByteBuffer b (doto (ByteBuffer/wrap bs) (.mark))
-        show-bytes (fn [c]
-                     (println c (.position b) (pr-str (String. ^bytes (into-array Byte/TYPE (take (.position b) bs)) "ASCII")))
-                     )]
+(comment
+  (let [^SocketChannel in (.accept ^ServerSocketChannel server-sock)
+        ^SocketChannel out (dbus-session-sock)]
+    (let [bs (byte-array 1024)
+          ^ByteBuffer b (doto (ByteBuffer/wrap bs) (.mark))
+          show-bytes (fn [c]
+                       (println c (.position b) (pr-str (String. ^bytes (into-array Byte/TYPE (take (.position b) bs)) "ASCII")))
+                       )]
 
-    (while true
-      (Thread/sleep 300)
-      (.read in b)
-      (show-bytes "> ")
-      (.flip b)
+      (while true
+        (Thread/sleep 300)
+        (.read in b)
+        (show-bytes "> ")
+        (.flip b)
 
-      (.write out b)
-      (.clear b)
-      (Thread/sleep 300)
-      (.read out b)
-      (show-bytes "< ")
-      (.flip b)
+        (.write out b)
+        (.clear b)
+        (Thread/sleep 300)
+        (.read out b)
+        (show-bytes "< ")
+        (.flip b)
 
-      (.write in b)
-      (.clear b)
+        (.write in b)
+        (.clear b)
+        )
       )
     )
-  )
 
-(let [b (ByteBuffer/allocate 100)]
-  (.mark 0)
-  (.put b 1)
-  (.flip b)
-  (.get b))
-""
-"l " #_len "    " #_seriel "   "
-"m   "
-A_
-__S1"" "o "
-__S2__ "   /org/freedesktop/DBus   "
-__S1"""s "
-__S2__"   org.freedesktop.DBus    "
-__S3"""s "
-__S3__"   Hello " "  "
-__S4"s "
-__S3__"   org.freedesktop.DBus    "
-""
-"l        " "m   "
-"   "
-"   /org/freedesktop/DBus         Hello         org.freedesktop.DBus          org.freedesktop.DBus "
+  (let [b (ByteBuffer/allocate 100)]
+    (.mark 0)
+    (.put b 1)
+    (.flip b)
+    (.get b)))
 
-(count "/org/freedesktop/DBus")
+(comment
+  ""
+  "l " #_len "    " #_serial "   "
+  "m   "
+  A_
+  __S1"" "o "
+  __S2__ "   /org/freedesktop/DBus   "
+  __S1"""s "
+  __S2__"   org.freedesktop.DBus    "
+  __S3"""s "
+  __S3__"   Hello " "  "
+  __S4"s "
+  __S3__"   org.freedesktop.DBus    "
+  ""
+  "l        " "m   "
+  "   "
+  "   /org/freedesktop/DBus         Hello         org.freedesktop.DBus          org.freedesktop.DBus "
 
 
-(char 21) ;; => \
-(char 20) ;; => \
+
+  (char 21) ;; => \
+  (char 20)) ;; => \
+
+(comment
+  (=
+   "l        m   o    /org/freedesktop/DBus   s    org.freedesktop.DBus    s    Hello   s    org.freedesktop.DBus    "
+   "l        m   o    /org/freedesktop/DBus   s    org.freedesktop.DBus    s    Hello   s    org.freedesktop.DBus    ")
+
+  (long \M) ;; => 77
+  (long \m) ;; => 109
+  (=
+   "BEGIN\r\nl        m         /org/freedesktop/DBus         Hello         org.freedesktop.DBus          org.freedesktop.DBus    "
+   "BEGIN\r\nl        m   s    /org/freedesktop/DBus   s    Hello   s    org.freedesktop.DBus    s    org.freedesktop.DBus    "
+   "BEGIN\r\nl        m   o    /org/freedesktop/DBus   s    org.freedesktop.DBus    s    Hello   s    org.freedesktop.DBus    ")
+
+  (read-message (ByteBuffer/wrap (.getBytes "l        m   o    /org/freedesktop/DBus   s    org.freedesktop.DBus    s    Hello   s    org.freedesktop.DBus    ")))
+
+  (def offset 0)
+  (count "l        m   o    /org/freedesktop/DBus   s    Hello   s    org.freedesktop.DBus    s    org.freedesktop.DBus    ")
+
+
+  " AUTH\r\n"
+  "REJECTED EXTERNAL\r\n"
+  "AUTH EXTERNAL\r\n"
+  "DATA\r\n"
+  "DATA\r\n"
+  "OK 18f436e3312715725ef4204b67810658\r\n"
+  "NEGOTIATE_UNIX_FD\r\n"
+  "AGREE_UNIX_FD\r\n"
+  "BEGIN\r\n"
+  "l        m   o    /org/freedesktop/DBus   s    Hello   s    org.freedesktop.DBus    s    org.freedesktop.DBus    "
+
+
+  " AUTH\r\n"
+  "REJECTED EXTERNAL\r\n"
+  "AUTH EXTERNAL\r\n"
+  "DATA\r\n"
+  "DATA\r\n"
+  "OK 18f436e3312715725ef4204b67810658\r\n"
+  "NEGOTIATE_UNIX_FD\r\n"
+  "AGREE_UNIX_FD\r\n"
+  "BEGIN\r\n"
+
+  (=
+   "l        p   o    /org/freedesktop/DBus   s    Hello   s    org.freedesktop.DBus    s    org.freedesktop.DBus    "
+
+   "l        m   o    /org/freedesktop/DBus   s    Hello   s    org.freedesktop.DBus    s    org.freedesktop.DBus    ")
+
+  (- (long \p) (long \m)))
