@@ -1,1 +1,16 @@
 ➜ jextract -I /usr/lib/x86_64-linux-gnu/dbus-1.0/include -I /usr/include/dbus-1.0/ /usr/include/dbus-1.0/dbus/dbus.h --target-package net.arnebrasseur.ffi --header-class-name DBus --library dbus --output src-java
+
+https://gist.github.com/GrabbenD/6658c36a1c7fc7ee30ee2498647ca4c6
+
+
+Software that uses libsecret:
+
+- browsers (but NOT firefox :( https://bugzilla.mozilla.org/show_bug.cgi?id=1463865)
+- tilix (tiling terminal emulator, with "insert password" functionality)
+- MS library for accessing libsecret from Java https://github.com/microsoft/credential-secure-storage-for-java
+- https://github.com/qsdfplkj/git-credential-manager
+- Darktable (photo management) https://github.com/9uenther/darktable
+- docker-credential-helpers
+- git · contrib/credential/libsecret/git-credential-libsecret.c
+- remmina (gtk remote desktop client)
+
