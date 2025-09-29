@@ -1,7 +1,7 @@
 
 {:paths ["src-java" "dbus-java-core-5.1.1-20241220.160111-17.jar" "src"]
  :deps {#_#_com.github.hypfvieh/dbus-java-core {:mvn/version "5.1.1"}
-        com.github.hypfvieh/dbus-java-transport-native-unixsocket {:mvn/version "5.1.0"}
-        ch.qos.logback/logback-classic {:mvn/version "1.5.16"}
+        com.github.hypfvieh/dbus-java-transport-native-unixsocket {:mvn/version "5.1.1"}
+        ch.qos.logback/logback-classic {:mvn/version "1.5.18"}
         lambdaisland/uri {:mvn/version "1.19.155"}}
  }
